@@ -1375,6 +1375,7 @@ class ClangASTConverter:
         is_cplus: bool = False,
         allowlist_paths: _PathSet | None = None,
         denylist_paths: _PathSet | None = None,
+        merged_include_paths: frozenset[str] = frozenset(),
         parse_args: tuple[str, ...] = (),
     ) -> None:
         self.filename = filename
@@ -1382,6 +1383,13 @@ class ClangASTConverter:
         self.is_cplus = is_cplus
         self.allowlist_paths = allowlist_paths
         self.denylist_paths = denylist_paths
+        #: Resolved paths of the included headers ``recursive_includes`` merges,
+        #: as decided by :meth:`LibclangBackend._admitted_includes`.
+        self.merged_include_paths = merged_include_paths
+        # Location file spelling -> whether its cursors are converted. Every
+        # top-level cursor of the translation unit, system headers included, is
+        # tested, and the answer for a file never changes within one conversion.
+        self._target_file_cache: dict[str, bool] = {}
         #: Whether this translation unit's target gives an unnamed bit-field's
         #: alignment to its record. Measured once per argument set; None when
         #: the probe could not be measured at all, which is reported on any
@@ -1812,15 +1820,16 @@ class ClangASTConverter:
 
         Returns True if cursor is from:
         1. The main target file (self.filename), OR
-        2. A path under one of the project_prefixes (for umbrella headers), OR
-        3. One of the allowlisted files
+        2. An included header that ``recursive_includes`` merges, OR
+        3. A path under one of the project_prefixes (for umbrella headers), OR
+        4. One of the allowlisted files
 
         and is not named by the denylist.  The main file is exempt from the
         denylist: denying the file the caller asked to parse would return an
         empty result with nothing to explain it, which is a silent failure
         wearing the costume of a successful parse.
 
-        Cases 2 and 3 compare absolute, symlink-resolved paths.  clang reports a
+        Cases 2 to 4 compare absolute, symlink-resolved paths.  clang reports a
         location as the path it was included by -- typically relative, e.g.
         ``./tux_foo.h`` -- so comparing the raw spelling against a caller-supplied
         absolute path never matches.
@@ -1830,13 +1839,25 @@ class ClangASTConverter:
             return False
 
         file_path = str(loc.file.name)
+        cached = self._target_file_cache.get(file_path)
+        if cached is None:
+            cached = self._is_target_path(file_path)
+            self._target_file_cache[file_path] = cached
+        return cached
 
+    def _is_target_path(self, file_path: str) -> bool:
+        """Uncached body of :meth:`_is_from_target_file`, keyed on the location's file spelling."""
         # Check main file.  Deliberately ahead of the denylist: the main file
         # cannot be denied out of existence.
         if normalize_path(file_path) == normalize_path(self.filename):
             return True
 
-        if not self.project_prefixes and not self.allowlist_paths and not self.denylist_paths:
+        if (
+            not self.project_prefixes
+            and not self.allowlist_paths
+            and not self.denylist_paths
+            and not self.merged_include_paths
+        ):
             return False
 
         resolved = _resolve_path(file_path)
@@ -1844,6 +1865,10 @@ class ClangASTConverter:
         # Deny wins over allow.
         if self.denylist_paths is not None and self.denylist_paths.matches(resolved):
             return False
+
+        # Check included headers merged by ``recursive_includes``
+        if resolved in self.merged_include_paths:
+            return True
 
         # Check allowlisted files
         if self.allowlist_paths is not None and self.allowlist_paths.matches(resolved):
@@ -4393,10 +4418,6 @@ class LibclangBackend:
 
     def __init__(self) -> None:
         self._index: Any = None
-        # Cache for parsed headers (path -> Header) to avoid re-parsing
-        self._parse_cache: dict[str, Header] = {}
-        # Visited set to prevent circular includes
-        self._visited: set[str] = set()
         # Normalized paths clang itself classified as system headers, accumulated
         # across every translation unit this backend has parsed.
         self._clang_system_headers: set[str] = set()
@@ -4444,185 +4465,47 @@ class LibclangBackend:
             self._index = _cindex.Index.create()
         return self._index
 
-    def _resolve_include_path(
+    def _admitted_includes(
         self,
-        include_path: str,
-        base_dir: str,
-        include_dirs: list[str],
-    ) -> str | None:
-        """Resolve an include path to an absolute path.
-
-        :param include_path: The include path as it appears in the header
-        :param base_dir: Directory of the including file
-        :param include_dirs: List of include search directories
-        :returns: Absolute path to the header file, or None if not found
-        """
-        # If already absolute, return as-is
-        if os.path.isabs(include_path):
-            if os.path.exists(include_path):
-                return os.path.abspath(include_path)
-            return None
-
-        # Try relative to base directory first
-        candidate = os.path.join(base_dir, include_path)
-        if os.path.exists(candidate):
-            return os.path.abspath(candidate)
-
-        # Try each include directory
-        for inc_dir in include_dirs:
-            candidate = os.path.join(inc_dir, include_path)
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
-
-        return None
-
-    def _parse_header_file(
-        self,
-        header_path: str,
-        include_dirs: list[str],
-        extra_args: list[str],
-        use_default_includes: bool,
-    ) -> Header:
-        """Parse a single header file.
-
-        :param header_path: Absolute path to header file
-        :param include_dirs: Include directories
-        :param extra_args: Extra compiler arguments
-        :param use_default_includes: Whether to use system includes
-        :returns: Parsed Header IR
-        """
-        # Check cache
-        if header_path in self._parse_cache:
-            return self._parse_cache[header_path]
-
-        # Read the file
-        with open(header_path, encoding="utf-8", errors="replace") as f:
-            code = f.read()
-
-        # Parse using the main parse method
-        # Use the basename for the filename to match expected behavior
-        filename = os.path.basename(header_path)
-        header = self.parse(
-            code,
-            filename,
-            include_dirs=include_dirs,
-            extra_args=extra_args,
-            use_default_includes=use_default_includes,
-            recursive_includes=False,  # Prevent infinite recursion
-        )
-
-        # Cache the result
-        self._parse_cache[header_path] = header
-        return header
-
-    def _parse_recursively(
-        self,
-        main_header: Header,
-        main_path: str,
-        include_dirs: list[str],
-        extra_args: list[str],
-        use_default_includes: bool,
+        tu: Any,
         max_depth: int,
-        current_depth: int = 0,
-        project_prefixes: tuple[str, ...] | None = None,
-        allowlist_paths: _PathSet | None = None,
-        denylist_paths: _PathSet | None = None,
-    ) -> Header:
-        """Recursively parse included headers and combine declarations.
+        project_prefixes: tuple[str, ...] | None,
+        allowlist_paths: _PathSet | None,
+        denylist_paths: _PathSet | None,
+    ) -> frozenset[str]:
+        """Resolved paths of the included headers whose declarations are merged.
 
-        :param main_header: The main header that was parsed
-        :param main_path: Path to the main header file
-        :param include_dirs: Include directories
-        :param extra_args: Extra compiler arguments
-        :param use_default_includes: Whether to use system includes
-        :param max_depth: Maximum recursion depth
-        :param current_depth: Current recursion depth
-        :param project_prefixes: Optional tuple of path prefixes to treat as project (not system)
-        :param allowlist_paths: Resolved allowlist entries, or None when the caller supplied
-            none. Included headers not named here are not descended into.
-        :param denylist_paths: Resolved denylist entries, or None. Named headers are not
-            descended into even when the allowlist names them -- deny wins over allow.
-        :returns: Combined Header with declarations from all includes
+        The answer comes from the main translation unit's own inclusion record,
+        so it names exactly the files the preprocessor entered -- a header behind
+        an ``#if`` branch that was not taken is absent -- and their declarations
+        are read from that same translation unit by the converter.  Parsing each
+        header again as its own translation unit would lose every typedef and
+        macro an earlier include supplied, and would evaluate its conditionals
+        without them.
+
+        :param tu: The main translation unit.
+        :param max_depth: Deepest ``#include`` nesting admitted; 1 is a direct include.
+        :param project_prefixes: Path prefixes that override every system classification.
+        :param allowlist_paths: Resolved allowlist entries, or None when the caller
+            supplied none. Included headers not named here are not admitted.
+        :param denylist_paths: Resolved denylist entries, or None. Named headers are
+            not admitted even when the allowlist names them -- deny wins over allow.
+        :returns: Absolute, symlink-resolved paths, comparable with :func:`_resolve_path`.
         """
-        if current_depth >= max_depth:
-            return main_header
-
-        all_declarations: list[Declaration] = list(main_header.declarations)
-        main_dir = os.path.dirname(os.path.abspath(main_path))
-
-        for include_path in sorted(main_header.included_headers):
-            # Skip system headers (unless allowlisted via project_prefixes)
+        admitted: set[str] = set()
+        for inclusion in tu.get_includes():
+            if inclusion.depth > max_depth:
+                continue
+            include_path = str(inclusion.include.name)
             if self._is_system_include(include_path, project_prefixes):
                 continue
-
-            # Get absolute path
-            abs_path = self._resolve_include_path(
-                include_path,
-                main_dir,
-                include_dirs,
-            )
-
-            if abs_path is None:
-                # Could not resolve - skip
+            resolved = _resolve_path(include_path)
+            if denylist_paths is not None and denylist_paths.matches(resolved):
                 continue
-
-            # Check if already visited (circular include)
-            if abs_path in self._visited:
+            if allowlist_paths is not None and not allowlist_paths.matches(resolved):
                 continue
-
-            # The allowlist and denylist narrow the *merged* result, not only the
-            # main translation unit: an included header the caller did not allow,
-            # or explicitly denied, is never descended into and so contributes
-            # nothing to the merge.  Deny wins over allow.
-            resolved_include = _resolve_path(abs_path)
-            if denylist_paths is not None and denylist_paths.matches(resolved_include):
-                continue
-            if allowlist_paths is not None and not allowlist_paths.matches(resolved_include):
-                continue
-
-            self._visited.add(abs_path)
-
-            try:
-                # Parse the included header
-                sub_header = self._parse_header_file(
-                    abs_path,
-                    include_dirs,
-                    extra_args,
-                    use_default_includes,
-                )
-
-                # Recursively process its includes
-                sub_header = self._parse_recursively(
-                    sub_header,
-                    abs_path,
-                    include_dirs,
-                    extra_args,
-                    use_default_includes,
-                    max_depth,
-                    current_depth + 1,
-                    project_prefixes,
-                    allowlist_paths,
-                    denylist_paths,
-                )
-
-                # Add declarations from sub-header
-                all_declarations.extend(sub_header.declarations)
-
-            except (OSError, RuntimeError, ValueError):
-                import logging
-
-                logging.getLogger(__name__).debug("Failed to parse included header: %s", abs_path, exc_info=True)
-                continue
-
-        # Deduplicate declarations
-        unique_declarations = _deduplicate_declarations(all_declarations)
-
-        # Return combined header
-        return Header(
-            path=main_header.path,
-            declarations=unique_declarations,
-            included_headers=main_header.included_headers,
-        )
+            admitted.add(resolved)
+        return frozenset(admitted)
 
     def parse(
         self,
@@ -4644,13 +4527,14 @@ class LibclangBackend:
 
         Traversal and filtering
         -----------------------
-        ``recursive_includes`` (True by default) governs *traversal*: it descends
-        into each non-system header named by an ``#include``, parses it as its own
-        translation unit, and merges what it declares.  ``project_prefixes``
-        (through :func:`_is_system_header`) decides which paths count as project
-        rather than system headers, ``max_depth`` bounds the descent, and an
-        internal visited set stops mutually including headers from recursing
-        forever.
+        ``recursive_includes`` (True by default) governs *traversal*: it merges
+        the declarations of each non-system header the preprocessor entered while
+        reading ``filename``.  They are read from ``filename``'s own translation
+        unit, in source order, so a header that relies on an earlier include for
+        a typedef or a macro -- including one its ``#if`` tests -- is read exactly
+        as the compiler reads it.  ``project_prefixes`` (through
+        :func:`_is_system_header`) decides which paths count as project rather
+        than system headers, and ``max_depth`` bounds the ``#include`` nesting.
 
         ``allowlist`` and ``denylist`` govern *filtering*, and they narrow the
         merged result in **both** modes.  A header the allowlist does not name is
@@ -4681,8 +4565,9 @@ class LibclangBackend:
             included header and merge its declarations into the result. System
             headers are always skipped. Set to False to parse only the main file,
             which is the only way to keep included declarations out entirely.
-        :param max_depth: Maximum recursion depth for include processing (default 10).
-            Prevents infinite recursion from circular includes.
+        :param max_depth: Deepest ``#include`` nesting whose declarations are merged
+            (default 10). A header ``filename`` includes directly is at depth 1, so
+            0 merges no included header at all.
         :param project_prefixes: Optional tuple of path prefixes to treat as project
             headers (not system). Use this for umbrella headers of libraries installed
             in system locations (e.g., ``("/opt/homebrew/include/sodium",)``).
@@ -4859,12 +4744,21 @@ class LibclangBackend:
         search_dirs = _filter_search_dirs(filename, include_dirs)
         allowlist_paths = None if allowlist is None else _PathSet(allowlist, search_dirs)
         denylist_paths = None if denylist is None else _PathSet(denylist, search_dirs)
+        # ``recursive_includes`` is the caller's answer, so nothing here second-guesses
+        # it from the header's shape. Scope is bounded by _is_system_header /
+        # project_prefixes, allowlist, denylist, and max_depth.
+        merged_includes = (
+            self._admitted_includes(tu, max_depth, project_prefixes, allowlist_paths, denylist_paths)
+            if recursive_includes
+            else frozenset()
+        )
         converter = ClangASTConverter(
             filename,
             project_prefixes=project_prefixes,
             is_cplus=is_cplus,
             allowlist_paths=allowlist_paths,
             denylist_paths=denylist_paths,
+            merged_include_paths=merged_includes,
             parse_args=tuple(args),
         )
         header = converter.convert(tu)
@@ -4872,40 +4766,16 @@ class LibclangBackend:
         # Attach included headers to the IR
         header.included_headers = included_headers
 
-        # Check if we should do recursive include processing
-        # ``recursive_includes`` is the caller's answer, so nothing here second-guesses
-        # it from the header's shape. Scope is bounded by _is_system_header /
-        # project_prefixes, allowlist, max_depth, and self._visited.
-        has_project_include = any(not self._is_system_include(h, project_prefixes) for h in header.included_headers)
-        if recursive_includes and has_project_include:
-            # Reset visited set for each top-level parse
-            self._visited = set()
-            # Add current file to visited
-            if os.path.exists(filename):
-                abs_filename = os.path.abspath(filename)
-            else:
-                # For in-memory code, use filename as-is
-                abs_filename = filename
-            self._visited.add(abs_filename)
+        # Several files may legitimately declare the same entity (a repeated
+        # prototype, a forward declaration in one header and the definition in
+        # another), so a result drawn from more than one file is collapsed.
+        if merged_includes:
+            header.declarations = _deduplicate_declarations(header.declarations)
 
-            # Recursively parse included headers
-            header = self._parse_recursively(
-                header,
-                abs_filename,
-                include_dirs or [],
-                extra_args or [],
-                use_default_includes,
-                max_depth,
-                project_prefixes=project_prefixes,
-                allowlist_paths=allowlist_paths,
-                denylist_paths=denylist_paths,
-            )
-
-        # Included headers are parsed in isolation, so a macro that a *later*
-        # header redefines is otherwise emitted with the stale value it had in
-        # the header that first defined it. The main translation unit's
-        # preprocessing record is the only place the real, ordered macro history
-        # is visible, so it decides the final state.
+        # A macro emitted from one file may be redefined or emptied by a file whose
+        # declarations are not emitted (a system or denied header). The main
+        # translation unit's preprocessing record holds the real, ordered macro
+        # history of every file, so it decides the final state.
         self._apply_final_macro_state(header, tu, converter)
         self._drop_undefined_macros(header, filename, code, args)
 

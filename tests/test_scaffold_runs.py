@@ -893,14 +893,12 @@ EXPR_SOURCE = textwrap.dedent("""\
     int expr_size(void) { return (int)sizeof(ExprHolder); }
 """)
 
-#: A *record* declared in an included header. The spelling half of this is fixed
-#: -- ``struct Swatch`` resolves to the class ``Swatch`` under libclang -- but the
-#: module still does not import, for a reason that is not about spelling at all:
-#: declarations are emitted in the order the backend reports them, and libclang
-#: reports the including file's declarations before the included file's, so
-#: ``class Swatch`` is written *after* the record whose ``_fields_`` names it.
-#: That is a declaration-ordering defect, it is not what this change is about,
-#: and it is loud on ``main`` too. The gate pins that it stays loud.
+#: A *record* declared in an included header. Under libclang ``struct Swatch``
+#: resolves to the class ``Swatch``, and because the backend reads the included
+#: file's declarations out of the main translation unit, they arrive in source
+#: order: ``class Swatch`` is written before the record whose ``_fields_`` names
+#: it. Under tree-sitter, which does not follow includes, the record is never
+#: seen, and the gate pins that this stays loud.
 INCLUDED_RECORD_HEADER = textwrap.dedent("""\
     #ifndef SWATCH_H
     #define SWATCH_H
@@ -919,6 +917,7 @@ INCLUDING_RECORD_HEADER = textwrap.dedent("""\
     typedef struct { struct Swatch s; } SwatchHolder;
 
     int swatch_hi(SwatchHolder h);
+    int swatch_holder_size(void);
 
     #endif
 """)
@@ -927,6 +926,7 @@ INCLUDING_RECORD_SOURCE = textwrap.dedent("""\
     #include "swuser.h"
 
     int swatch_hi(SwatchHolder h) { return h.s.hi; }
+    int swatch_holder_size(void) { return (int)sizeof(SwatchHolder); }
 """)
 
 #: An enum declared in a *different* header and reached through ``#include``.
@@ -2177,22 +2177,17 @@ class TestScaffoldedCtypesPackageRuns:
         )
         assert "PATH-OK" in result.stdout
 
-    def test_a_record_reached_through_an_include_fails_loudly(self, tmp_path: Path, backend_name: str) -> None:
-        """An included record resolves by name and still cannot import -- loudly.
+    def test_a_record_reached_through_an_include(self, tmp_path: Path, backend_name: str) -> None:
+        """An included record resolves by name and is bound before the record using it.
 
-        This is the record half of the ``#include`` question and it does not have
-        the enum's answer. Under libclang the spelling is now resolved correctly:
-        ``struct Swatch`` becomes the class ``Swatch``. The module still fails,
-        because declarations are emitted in the order the backend reports them
-        and libclang reports the *including* file first, so ``class Swatch`` is
-        written after the record whose ``_fields_`` names it. Under tree-sitter
-        the declaration is never seen at all.
-
-        Both are ``NameError`` at import, which is the property worth pinning: a
-        member silently typed as something else would be the defect this change
-        exists to avoid. Fixing the ordering means emitting records in dependency
-        order, which is a different defect in a different part of the writer, and
-        it is loud on ``main`` today as well.
+        This is the record half of the ``#include`` question. Under libclang the
+        spelling is resolved -- ``struct Swatch`` becomes the class ``Swatch`` --
+        and the included file's declarations are read from the main translation
+        unit in source order, so ``class Swatch`` is written before the record
+        whose ``_fields_`` names it, and the layout is checked against the C
+        compiler's. Under tree-sitter the declaration is never seen at all, and
+        the property worth pinning is that this is a ``NameError`` at import: a
+        member silently typed as something else would be the defect.
         """
         library = _build_c_library(
             tmp_path,
@@ -2210,18 +2205,31 @@ class TestScaffoldedCtypesPackageRuns:
             header=INCLUDING_RECORD_HEADER,
             filename=str(tmp_path / "swuser.h"),
         )
+        script = textwrap.dedent("""\
+            import ctypes
+            from swuser import _bindings as b
+
+            assert ctypes.sizeof(b.SwatchHolder) == b._lib.swatch_holder_size(), (
+                f"ctypes lays out {ctypes.sizeof(b.SwatchHolder)} bytes, "
+                f"the C compiler lays out {b._lib.swatch_holder_size()}"
+            )
+            assert b._lib.swatch_hi(b.SwatchHolder(s=b.Swatch(lo=3, hi=7))) == 7
+            print("SWATCH-MATCH")
+        """)
         result = _run_python(
-            "import swuser",
-            cwd=tmp_path,
-            env={"PYTHONPATH": str(root / "src"), "SWUSER_LIBRARY": str(library)},
+            script, cwd=tmp_path, env={"PYTHONPATH": str(root / "src"), "SWUSER_LIBRARY": str(library)}
         )
-        assert result.returncode != 0, (
-            "the package imported; if records are now emitted in dependency order, "
-            "this gate should assert the size and round-trip instead"
-        )
-        assert "Swatch" in result.stderr, (
-            f"the failure does not name the included record, so it may be unrelated:\n{result.stderr}"
-        )
+        if backend_name == "libclang":
+            assert result.returncode == 0, f"an included record should be bound before its user:\n{result.stderr}"
+            assert "SWATCH-MATCH" in result.stdout
+        else:
+            assert result.returncode != 0, (
+                "tree-sitter bound a record from a header it does not read; if the backend now "
+                "follows includes, this gate should assert the success branch instead"
+            )
+            assert "Swatch" in result.stderr, (
+                f"the failure does not name the included record, so it may be unrelated:\n{result.stderr}"
+            )
 
     def test_tag_named_records_match_the_c_abi_in_every_position(self, tmp_path: Path, backend_name: str) -> None:
         """A record named by its tag must resolve to its class, wherever it appears.

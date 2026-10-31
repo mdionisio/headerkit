@@ -1800,6 +1800,36 @@ class TestRecursiveIncludeExpansion:
         assert names == ["decl_1"], f"system declarations leaked: {names}"
         assert not any(d.name == "printf" for d in header.declarations)
 
+    @pytest.mark.parametrize(("max_depth", "expected"), [(1, ["mid_fn"]), (2, ["leaf_fn", "mid_fn"])])
+    def test_max_depth_bounds_include_nesting(self, tmp_path: Path, max_depth: int, expected: list[str]) -> None:
+        """A header nested deeper than ``max_depth`` contributes nothing; a direct include is depth 1."""
+        (tmp_path / "leaf.h").write_text("void leaf_fn(void);\n")
+        (tmp_path / "mid.h").write_text('#include "leaf.h"\nvoid mid_fn(void);\n')
+        top = tmp_path / "top.h"
+        top.write_text('#include "mid.h"\n')
+
+        header = self._parse(top, max_depth=max_depth)
+
+        assert [d.name for d in header.declarations] == expected
+
+    def test_a_typedef_from_an_included_file_does_not_hide_its_neighbours(self, tmp_path: Path) -> None:
+        """Declarations are read from the main translation unit, not by re-parsing each include.
+
+        ``api.h`` uses ``handle_t`` without including ``types.h``. Re-parsed on its
+        own it does not compile, which used to drop all of its declarations.
+        """
+        (tmp_path / "types.h").write_text("typedef int handle_t;\n")
+        (tmp_path / "api.h").write_text("handle_t open_handle(void);\n")
+        top = tmp_path / "top.h"
+        top.write_text('#include "types.h"\n#include "api.h"\n')
+
+        header = self._parse(top)
+
+        assert [(type(d).__name__, d.name) for d in header.declarations] == [
+            ("Typedef", "handle_t"),
+            ("Function", "open_handle"),
+        ]
+
 
 @libclang
 class TestClassTemplateForwardDeclaration:

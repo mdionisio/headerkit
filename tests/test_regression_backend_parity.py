@@ -54,6 +54,7 @@ from headerkit.ir import (
     Function,
     Parameter,
     SourceLocation,
+    SourceUnit,
     Struct,
 )
 from headerkit.writers import get_writer
@@ -1569,7 +1570,12 @@ class TestR14AllPaddingLayoutIsResolvedOnImport:
 
 @libclang
 class TestR15IncludeMergeOrderIsDeterministic:
-    """Recursive include merging produces deterministic declaration order across PYTHONHASHSEED values."""
+    """Recursive include merging produces deterministic declaration order across PYTHONHASHSEED values.
+
+    The order is the translation unit's source order -- each included header's
+    declarations where its ``#include`` sits -- which is what the compiler sees,
+    and which no hash-ordered collection of include paths may perturb.
+    """
 
     NAMES = ("alpha", "beta", "gamma", "delta", "epsilon", "zeta")
     SEEDS = ("0", "1", "2", "3", "4", "5")
@@ -1634,9 +1640,7 @@ class TestR15IncludeMergeOrderIsDeterministic:
             inc = self._layout(workdir)
             orders = {seed: self._run(workdir, self.PROBE, [str(inc)], seed) for seed in self.SEEDS}
 
-        expected_order = " ".join(
-            ["root_fn", *(item for name in sorted(self.NAMES) for item in (f"{name}_t", f"{name}_fn"))]
-        )
+        expected_order = " ".join([*(item for name in self.NAMES for item in (f"{name}_t", f"{name}_fn")), "root_fn"])
         assert orders == dict.fromkeys(self.SEEDS, expected_order)
 
 
@@ -1706,9 +1710,9 @@ class TestR16CyclicTypedefsAreOrdered:
                     value_destructor_cb_t destructor
 
 
-                void root_use(value_t* v, value_destructor_cb_t cb)
-
                 int list_release(value_t* v)
+
+                void root_use(value_t* v, value_destructor_cb_t cb)
             """)
 
     def test_cyclic_typedefs_compile_link_and_execute(self) -> None:
@@ -1804,19 +1808,20 @@ class TestR17DefinitionSurvivesIncludeMerge:
         with tempfile.TemporaryDirectory() as tmp:
             decls = self._declarations(Path(tmp), "a_forward.h", "b_definition.h")
 
+        definition = str(Path(tmp) / "b_definition.h")
         assert decls == [
+            Enum(
+                name="kind",
+                values=[EnumValue(name="KIND_A", value=3), EnumValue(name="KIND_B", value=5)],
+                location=SourceLocation(file=definition, line=3, column=6),
+            ),
             Struct(
                 name="rec",
                 fields=[
                     Field(name="x", type=CType(name="int"), access="public"),
                     Field(name="k", type=CType(name="enum kind", is_elaborated=True), access="public"),
                 ],
-                location=SourceLocation(file="b_definition.h", line=4, column=8),
-            ),
-            Enum(
-                name="kind",
-                values=[EnumValue(name="KIND_A", value=3), EnumValue(name="KIND_B", value=5)],
-                location=SourceLocation(file="b_definition.h", line=3, column=6),
+                location=SourceLocation(file=definition, line=4, column=8),
             ),
         ]
 
@@ -1824,11 +1829,12 @@ class TestR17DefinitionSurvivesIncludeMerge:
         with tempfile.TemporaryDirectory() as tmp:
             decls = self._declarations(Path(tmp), "b_forward.h", "a_definition.h")
 
+        definition = str(Path(tmp) / "a_definition.h")
         assert decls == [
             Enum(
                 name="kind",
                 values=[EnumValue(name="KIND_A", value=3), EnumValue(name="KIND_B", value=5)],
-                location=SourceLocation(file="a_definition.h", line=3, column=6),
+                location=SourceLocation(file=definition, line=3, column=6),
             ),
             Struct(
                 name="rec",
@@ -1836,7 +1842,7 @@ class TestR17DefinitionSurvivesIncludeMerge:
                     Field(name="x", type=CType(name="int"), access="public"),
                     Field(name="k", type=CType(name="enum kind", is_elaborated=True), access="public"),
                 ],
-                location=SourceLocation(file="a_definition.h", line=4, column=8),
+                location=SourceLocation(file=definition, line=4, column=8),
             ),
         ]
 
@@ -1914,7 +1920,14 @@ class TestR17DefinitionSurvivesIncludeMerge:
                 """)
             _cythonize(workdir, root, pxd, pyx, cplus=True)
 
+        definition = str(workdir / "b_definition.hpp")
         assert unit.declarations == [
+            Struct(
+                name="Base",
+                fields=[Field(name="b", type=CType(name="int"), access="public")],
+                is_cppclass=True,
+                location=SourceLocation(file=definition, line=4, column=7),
+            ),
             Struct(
                 name="Box",
                 is_cppclass=True,
@@ -1925,7 +1938,7 @@ class TestR17DefinitionSurvivesIncludeMerge:
                         return_type=CType(name="void"),
                         parameters=[Parameter(name="x", type=CType(name="int"))],
                         access="public",
-                        location=SourceLocation(file="b_definition.hpp", line=7, column=5),
+                        location=SourceLocation(file=definition, line=7, column=5),
                     )
                 ],
                 destructor=Function(
@@ -1933,15 +1946,9 @@ class TestR17DefinitionSurvivesIncludeMerge:
                     return_type=CType(name="void"),
                     parameters=[],
                     access="public",
-                    location=SourceLocation(file="b_definition.hpp", line=8, column=5),
+                    location=SourceLocation(file=definition, line=8, column=5),
                 ),
-                location=SourceLocation(file="b_definition.hpp", line=5, column=7),
-            ),
-            Struct(
-                name="Base",
-                fields=[Field(name="b", type=CType(name="int"), access="public")],
-                is_cppclass=True,
-                location=SourceLocation(file="b_definition.hpp", line=4, column=7),
+                location=SourceLocation(file=definition, line=5, column=7),
             ),
             Struct(
                 name="Holder",
@@ -1949,7 +1956,7 @@ class TestR17DefinitionSurvivesIncludeMerge:
                     Field(name="box", type=CType(name="struct Box", is_elaborated=True), access="public"),
                     Field(name="y", type=CType(name="int"), access="public"),
                 ],
-                location=SourceLocation(file="b_definition.hpp", line=10, column=8),
+                location=SourceLocation(file=definition, line=10, column=8),
             ),
         ]
         assert pxd == textwrap.dedent("""\
@@ -2080,9 +2087,137 @@ class TestR17DefinitionSurvivesIncludeMerge:
                 """)
             _cythonize(workdir, root, pxd, pyx, cplus=True)
 
-        expected_names = ["Box", "Base"] if member_kind == "bases" else ["Box"]
+        expected_names = ["Base", "Box"] if member_kind == "bases" else ["Box"]
         assert [(d.name, isinstance(d, Struct) and d.has_body) for d in unit.declarations] == [
             (name, True) for name in expected_names
         ]
         cimport = "from libcpp cimport bool\n\n" if member_kind == "conversions" else ""
         assert pxd == f'{cimport}cdef extern from "test.hpp":\n\n{expected_pxd_body}\n'
+
+
+# ---------------------------------------------------------------------------
+# R18 -- an included header is read in the context its includer gives it
+# ---------------------------------------------------------------------------
+
+
+@libclang
+class TestR18IncludedHeaderIsReadInContext:
+    """A header that is not self-contained still contributes its declarations.
+
+    ``api.h`` uses ``counter_t`` and tests ``WITH_STEP`` without including
+    ``types.h``; it relies on the including file to have done so first. Parsed
+    as its own translation unit it does not compile, and every declaration in it
+    used to disappear with nothing above DEBUG to say so. Its ``#if`` must also
+    be decided by the macro an earlier include defined, not by an empty context.
+    """
+
+    TYPES_H = textwrap.dedent("""\
+        #ifndef TYPES_H
+        #define TYPES_H
+        typedef int counter_t;
+        #define WITH_STEP 1
+        #endif
+        """)
+    API_H = textwrap.dedent("""\
+        #ifndef API_H
+        #define API_H
+        #if WITH_STEP
+        counter_t api_step(counter_t c, counter_t by);
+        #else
+        counter_t api_step_unavailable(void);
+        #endif
+        counter_t api_start(void);
+        #endif
+        """)
+    ROOT_H = "#include <types.h>\n#include <api.h>\n"
+
+    def _parse(self, workdir: Path) -> SourceUnit:
+        (workdir / "types.h").write_text(self.TYPES_H)
+        (workdir / "api.h").write_text(self.API_H)
+        return get_backend("libclang").parse(self.ROOT_H, "test.h", include_dirs=[str(workdir)])
+
+    def test_declarations_of_a_header_needing_an_earlier_include_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = self._parse(Path(tmp))
+            api = str(Path(tmp) / "api.h")
+
+        functions = [d for d in unit.declarations if isinstance(d, Function)]
+        assert functions == [
+            Function(
+                name="api_step",
+                return_type=CType(name="counter_t", is_elaborated=False),
+                parameters=[
+                    Parameter(name="c", type=CType(name="counter_t", is_elaborated=False)),
+                    Parameter(name="by", type=CType(name="counter_t", is_elaborated=False)),
+                ],
+                location=SourceLocation(file=api, line=4, column=11),
+            ),
+            Function(
+                name="api_start",
+                return_type=CType(name="counter_t", is_elaborated=False),
+                parameters=[],
+                location=SourceLocation(file=api, line=8, column=11),
+            ),
+        ]
+
+    def test_pxd_compiles_links_and_executes(self) -> None:
+        compiler = _require_c_toolchain()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            pxd = write_pxd(self._parse(workdir))
+            assert pxd == textwrap.dedent("""\
+                cdef extern from "test.h":
+
+                    int WITH_STEP
+
+                    ctypedef int counter_t
+
+                    counter_t api_step(counter_t c, counter_t by_)
+
+                    counter_t api_start()
+                """)
+            (workdir / "impl.c").write_text(
+                textwrap.dedent("""\
+                #include "test.h"
+                counter_t api_step(counter_t c, counter_t by) { return c + by; }
+                counter_t api_start(void) { return 40; }
+                """)
+            )
+            pyx = textwrap.dedent("""\
+                cimport defs
+                def call_it():
+                    return defs.api_step(defs.api_start(), defs.WITH_STEP + 1)
+                """)
+            _cythonize(workdir, self.ROOT_H, pxd, pyx)
+
+            built = _compile_c(workdir, compiler)
+            assert built.returncode == 0, f"mod.c failed to build:\n{built.stderr}"
+            impl = subprocess.run(
+                compile_object_command(compiler, "impl.c", "impl.o", includes=[workdir]),
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert impl.returncode == 0, f"impl.c failed to build:\n{impl.stderr}"
+
+            link = subprocess.run(
+                link_extension_command(compiler, ["mod.o", "impl.o"], "mod"),
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert link.returncode == 0, f"link failed:\n{link.stderr}"
+
+            run = subprocess.run(
+                [sys.executable, "-c", "import mod; print(mod.call_it())"],
+                cwd=workdir,
+                env={**os.environ, "PYTHONPATH": str(workdir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert run.returncode == 0, f"import/call failed:\n{run.stdout}\n{run.stderr}"
+
+        assert run.stdout.strip() == "42"

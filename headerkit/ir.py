@@ -1166,8 +1166,7 @@ class ParserBackend(Protocol):  # pylint: disable=too-few-public-methods
         ``recursive_includes`` governs *traversal*: descending into each
         non-system included header and merging what it declares.
         ``project_prefixes`` decides which paths count as project rather than
-        system headers, and ``max_depth`` (with a backend-internal cycle guard)
-        bounds the descent.
+        system headers, and ``max_depth`` bounds the ``#include`` nesting.
 
         ``allowlist`` and ``denylist`` govern *filtering*, and they narrow the
         merged result in **both** traversal modes:
@@ -1194,7 +1193,8 @@ class ParserBackend(Protocol):  # pylint: disable=too-few-public-methods
             and merge their declarations into the result. False parses only the
             main file, and is the only way to exclude included declarations
             entirely.
-        :param max_depth: Maximum recursion depth for include processing.
+        :param max_depth: Deepest ``#include`` nesting whose declarations are
+            merged. A header the main file includes directly is at depth 1.
         :param project_prefixes: Path prefixes to treat as project headers rather
             than system headers, so that they are descended into.
         :param allowlist: Files whose declarations are kept, alongside the main
